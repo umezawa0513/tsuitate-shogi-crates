@@ -8,6 +8,23 @@ INITIAL_SFEN = (
     "PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
 )
 
+ATTACK_COUNT_PIECES = (
+    "P",
+    "L",
+    "N",
+    "S",
+    "G",
+    "B",
+    "R",
+    "K",
+    "+P",
+    "+L",
+    "+N",
+    "+S",
+    "+B",
+    "+R",
+)
+
 
 def new_standard_game():
     return tb.Game(INITIAL_SFEN, 1, False, 3, 9, 9, 150)
@@ -160,6 +177,51 @@ def test_attack_counts_distance_limit_does_not_affect_short_range_pieces():
     index = lambda file, rank: (rank - 1) * 9 + (9 - file)
 
     assert game.attack_counts("+", max_sliding_distance=0)[index(5, 4)] == 1
+
+
+@pytest.mark.parametrize(
+    ("piece_kind_index", "piece"), tuple(enumerate(ATTACK_COUNT_PIECES))
+)
+def test_attack_counts_by_piece_kind_uses_documented_order(piece_kind_index, piece):
+    game = tb.Game(
+        f"sfen 9/9/9/9/4{piece}4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150
+    )
+
+    aggregate = game.attack_counts("+")
+    by_kind = game.attack_counts_by_piece_kind("+")
+
+    assert isinstance(by_kind, bytes)
+    assert len(by_kind) == len(ATTACK_COUNT_PIECES) * 81
+    for actual_index in range(len(ATTACK_COUNT_PIECES)):
+        plane = by_kind[actual_index * 81 : (actual_index + 1) * 81]
+        assert plane == (aggregate if actual_index == piece_kind_index else bytes(81))
+
+
+def test_attack_counts_by_piece_kind_matches_aggregate_options():
+    for is_tsuitate in (False, True):
+        game = tb.Game(INITIAL_SFEN, 1, is_tsuitate, 3, 9, 9, 150)
+        for csa_color in ("+", "-"):
+            for treat_friendly_target_as_empty in (False, True):
+                for max_sliding_distance in (None, 0, 1):
+                    aggregate = game.attack_counts(
+                        csa_color,
+                        treat_friendly_target_as_empty=treat_friendly_target_as_empty,
+                        max_sliding_distance=max_sliding_distance,
+                    )
+                    by_kind = game.attack_counts_by_piece_kind(
+                        csa_color,
+                        treat_friendly_target_as_empty=treat_friendly_target_as_empty,
+                        max_sliding_distance=max_sliding_distance,
+                    )
+                    summed = bytes(
+                        sum(by_kind[piece_kind_index * 81 + square_index]
+                            for piece_kind_index in range(len(ATTACK_COUNT_PIECES)))
+                        for square_index in range(81)
+                    )
+                    assert summed == aggregate
+
+    with pytest.raises(ValueError):
+        game.attack_counts_by_piece_kind("*")
 
 
 def test_analyze_moves_returns_batch_results_without_mutating_game():

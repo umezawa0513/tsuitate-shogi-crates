@@ -178,6 +178,30 @@ impl PyGame {
 
     #[pyo3(signature = (
         csa_color,
+        treat_friendly_target_as_empty=true,
+        max_sliding_distance=None
+    ))]
+    /// Count attacks by piece kind. The flat result contains 14 consecutive
+    /// SFEN-order planes in pawn, lance, knight, silver, gold, bishop, rook,
+    /// king, promoted pawn, promoted lance, promoted knight, promoted silver,
+    /// promoted bishop, and promoted rook order.
+    fn attack_counts_by_piece_kind(
+        &self,
+        csa_color: &str,
+        treat_friendly_target_as_empty: bool,
+        max_sliding_distance: Option<u8>,
+    ) -> PyResult<Vec<u8>> {
+        let color =
+            parse_csa_color(csa_color).ok_or_else(|| PyValueError::new_err("invalid color"))?;
+        Ok(self.inner.attack_counts_by_piece_kind(
+            color,
+            treat_friendly_target_as_empty,
+            max_sliding_distance,
+        ))
+    }
+
+    #[pyo3(signature = (
+        csa_color,
         moves,
         include_attack_counts=true,
         treat_friendly_target_as_empty=true,

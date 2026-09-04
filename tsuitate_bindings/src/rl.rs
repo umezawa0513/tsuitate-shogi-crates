@@ -1,5 +1,6 @@
 use crate::game_api::{
-    GameApi, INFO_CHECK, INFO_FOUL, INFO_FOUL_UNDER_CHECK, INFO_LOSS_BY_FOUL, INFO_NONE,
+    ATTACK_COUNT_PIECE_KINDS, GameApi, INFO_CHECK, INFO_FOUL, INFO_FOUL_UNDER_CHECK,
+    INFO_LOSS_BY_FOUL, INFO_NONE,
 };
 use shogi_core::{Bitboard, Color, Move, PartialPosition, Piece, PieceKind, Square};
 use shogi_legality_extended::{Setting, is_valid};
@@ -16,23 +17,6 @@ pub(crate) const OBSERVATION_CHANNEL_COUNT: usize =
     OBSERVATION_CHANNELS_PER_SIDE * OBSERVATION_SIDE_COUNT;
 pub(crate) const OBSERVATION_BYTES: usize = OBSERVATION_CHANNEL_COUNT * 16;
 
-const BOARD_OBSERVATION_PIECE_KINDS: [PieceKind; 14] = [
-    PieceKind::Pawn,
-    PieceKind::Lance,
-    PieceKind::Knight,
-    PieceKind::Silver,
-    PieceKind::Gold,
-    PieceKind::Bishop,
-    PieceKind::Rook,
-    PieceKind::King,
-    PieceKind::ProPawn,
-    PieceKind::ProLance,
-    PieceKind::ProKnight,
-    PieceKind::ProSilver,
-    PieceKind::ProBishop,
-    PieceKind::ProRook,
-];
-
 const HAND_OBSERVATION_SPECS: [(PieceKind, usize); 7] = [
     (PieceKind::Pawn, 18),
     (PieceKind::Lance, 4),
@@ -47,8 +31,7 @@ const HAND_OBSERVATION_BINARY_CHANNELS: usize = 18 + 4 + 4 + 4 + 4 + 2 + 2;
 const OBSERVATION_SIDES: [Color; 2] = [Color::Black, Color::White];
 
 const OBS_BOARD_CHANNEL_OFFSET: usize = 0;
-const OBS_HAND_CHANNEL_OFFSET: usize =
-    OBS_BOARD_CHANNEL_OFFSET + BOARD_OBSERVATION_PIECE_KINDS.len();
+const OBS_HAND_CHANNEL_OFFSET: usize = OBS_BOARD_CHANNEL_OFFSET + ATTACK_COUNT_PIECE_KINDS.len();
 const OBS_LAST_MOVE_FROM_MOVE_CHANNEL: usize =
     OBS_HAND_CHANNEL_OFFSET + HAND_OBSERVATION_BINARY_CHANNELS;
 const OBS_LAST_MOVE_FROM_DROP_OFFSET: usize = OBS_LAST_MOVE_FROM_MOVE_CHANNEL + 1;
@@ -283,7 +266,7 @@ pub(crate) fn fill_observations(game: &GameApi, observations: &mut [Bitboard]) {
     let last_info = game.last_info();
 
     for (side_index, side) in OBSERVATION_SIDES.iter().enumerate() {
-        for (channel_index, piece_kind) in BOARD_OBSERVATION_PIECE_KINDS.iter().enumerate() {
+        for (channel_index, piece_kind) in ATTACK_COUNT_PIECE_KINDS.iter().enumerate() {
             set_observation_channel(
                 observations,
                 side_index,

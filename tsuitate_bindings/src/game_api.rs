@@ -21,6 +21,23 @@ pub(crate) const INFO_CHECKMATE: u8 = 4;
 pub(crate) const INFO_LOSS_BY_FOUL: u8 = 5;
 pub(crate) const INFO_DRAW: u8 = 6;
 
+pub(crate) const ATTACK_COUNT_PIECE_KINDS: [PieceKind; 14] = [
+    PieceKind::Pawn,
+    PieceKind::Lance,
+    PieceKind::Knight,
+    PieceKind::Silver,
+    PieceKind::Gold,
+    PieceKind::Bishop,
+    PieceKind::Rook,
+    PieceKind::King,
+    PieceKind::ProPawn,
+    PieceKind::ProLance,
+    PieceKind::ProKnight,
+    PieceKind::ProSilver,
+    PieceKind::ProBishop,
+    PieceKind::ProRook,
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GameApiError {
     UnknownGameKind,
@@ -468,6 +485,28 @@ impl GameApi {
         )
     }
 
+    /// Returns one attack-count plane per piece kind. Piece kinds use
+    /// `ATTACK_COUNT_PIECE_KINDS` order and every plane uses SFEN board order.
+    pub(crate) fn attack_counts_by_piece_kind(
+        &self,
+        color: Color,
+        treat_friendly_target_as_empty: bool,
+        max_sliding_distance: Option<u8>,
+    ) -> Vec<u8> {
+        let plane_size = self.setting.files as usize * self.setting.ranks as usize;
+        let mut counts = vec![0u8; ATTACK_COUNT_PIECE_KINDS.len() * plane_size];
+        self.for_each_attack_index_with_tsuitate_setting(
+            color,
+            treat_friendly_target_as_empty,
+            max_sliding_distance,
+            self.setting.is_tsuitate,
+            |piece_kind_index, square_index| {
+                counts[piece_kind_index * plane_size + square_index] += 1;
+            },
+        );
+        counts
+    }
+
     fn attack_counts_with_tsuitate_setting(
         &self,
         color: Color,
@@ -475,6 +514,25 @@ impl GameApi {
         max_sliding_distance: Option<u8>,
         is_tsuitate: bool,
     ) -> Vec<u8> {
+        let mut counts = vec![0u8; self.setting.files as usize * self.setting.ranks as usize];
+        self.for_each_attack_index_with_tsuitate_setting(
+            color,
+            treat_friendly_target_as_empty,
+            max_sliding_distance,
+            is_tsuitate,
+            |_piece_kind_index, square_index| counts[square_index] += 1,
+        );
+        counts
+    }
+
+    fn for_each_attack_index_with_tsuitate_setting(
+        &self,
+        color: Color,
+        treat_friendly_target_as_empty: bool,
+        max_sliding_distance: Option<u8>,
+        is_tsuitate: bool,
+        mut visit: impl FnMut(usize, usize),
+    ) {
         let mut target_position = self.position().clone();
         if treat_friendly_target_as_empty {
             for square in Square::all() {
@@ -492,12 +550,16 @@ impl GameApi {
         } else {
             !self.position().vacant_bitboard()
         };
-        let mut counts = vec![0u8; self.setting.files as usize * self.setting.ranks as usize];
         let mut pieces = self.position().player_bitboard(color) & self.setting.board_mask;
         while let Some(from) = pieces.pop() {
             let Some(piece) = self.position().piece_at(from) else {
                 continue;
             };
+            let piece_kind_index = piece.piece_kind() as usize - PieceKind::Pawn as usize;
+            debug_assert_eq!(
+                ATTACK_COUNT_PIECE_KINDS[piece_kind_index],
+                piece.piece_kind()
+            );
             let mut attacks = from_candidates_without_assertion(
                 occupied,
                 &target_position,
@@ -517,10 +579,9 @@ impl GameApi {
             while let Some(square) = attacks.pop() {
                 let index = (square.rank() as usize - 1) * self.setting.files as usize
                     + (self.setting.files - square.file()) as usize;
-                counts[index] += 1;
+                visit(piece_kind_index, index);
             }
         }
-        counts
     }
 
     pub(crate) fn analyze_moves(
@@ -920,6 +981,50 @@ mod tests {
 
         let counts = game.attack_counts(Color::Black, false, None);
         assert_eq!(counts[index(5, 6)], 0);
+    }
+
+    #[test]
+    fn attack_counts_by_piece_kind_sum_to_aggregate_counts() {
+        for is_tsuitate in [false, true] {
+            let game = GameApi::new(
+                "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+                GameKind::Shogi.to_u8(),
+                is_tsuitate,
+                3,
+                9,
+                9,
+                150,
+                None,
+            )
+            .unwrap();
+
+            for color in [Color::Black, Color::White] {
+                for treat_friendly_target_as_empty in [false, true] {
+                    for max_sliding_distance in [None, Some(0), Some(1)] {
+                        let aggregate = game.attack_counts(
+                            color,
+                            treat_friendly_target_as_empty,
+                            max_sliding_distance,
+                        );
+                        let by_kind = game.attack_counts_by_piece_kind(
+                            color,
+                            treat_friendly_target_as_empty,
+                            max_sliding_distance,
+                        );
+
+                        assert_eq!(by_kind.len(), ATTACK_COUNT_PIECE_KINDS.len() * 81);
+                        for square_index in 0..81 {
+                            let sum: u16 = (0..ATTACK_COUNT_PIECE_KINDS.len())
+                                .map(|piece_kind_index| {
+                                    u16::from(by_kind[piece_kind_index * 81 + square_index])
+                                })
+                                .sum();
+                            assert_eq!(sum, u16::from(aggregate[square_index]));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
