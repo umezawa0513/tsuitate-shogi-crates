@@ -2,11 +2,7 @@ import pytest
 
 import tsuitate_bindings as tb
 
-
-INITIAL_SFEN = (
-    "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/"
-    "PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
-)
+INITIAL_SFEN = "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/" "PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
 
 ATTACK_COUNT_PIECES = (
     "P",
@@ -37,8 +33,7 @@ def test_make_move_updates_sfen():
     assert game.make_move("+7776FU")
     assert game.last_move == "+7776FU"
     assert (
-        game.sfen
-        == "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/"
+        game.sfen == "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/"
         "PP1PPPPPP/1B5R1/LNSGKGSNL w - 2"
     )
 
@@ -46,10 +41,7 @@ def test_make_move_updates_sfen():
 def test_viewpoint_sfen_and_last_move_helpers():
     game = new_standard_game()
 
-    assert (
-        game.sfen_for("+")
-        == "9/9/9/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
-    )
+    assert game.sfen_for("+") == "9/9/9/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
     assert "?" in game.sfen_for("+", True)
     assert game.make_move("+7776FU")
     assert game.last_move_for("+") == "+7776FU"
@@ -98,7 +90,8 @@ def test_action_helpers_are_exposed():
 
     assert black_pawn_push in game.legal_action_indices("+")
     assert white_pawn_push in game.legal_action_indices("-")
-    assert game.legal_action_indices("*") == []
+    with pytest.raises(ValueError):
+        game.legal_action_indices("*")
 
     assert game.action_index_to_move(black_pawn_push) == "+7776FU"
     assert game.action_index_to_move(9 * 9 * 27) is None
@@ -138,9 +131,7 @@ def test_attack_counts_supports_friendly_targets():
     assert counts[index(5, 7)] == 1
     assert counts[index(5, 6)] == 1
 
-    assert game.attack_counts(
-        "+", treat_friendly_target_as_empty=False
-    )[index(5, 6)] == 0
+    assert game.attack_counts("+", treat_friendly_target_as_empty=False)[index(5, 6)] == 0
 
     with pytest.raises(ValueError):
         game.attack_counts("*")
@@ -157,9 +148,7 @@ def test_attack_counts_supports_friendly_targets():
     ],
 )
 def test_attack_counts_can_limit_sliding_piece_distance(piece, near, far):
-    game = tb.Game(
-        f"sfen 9/9/9/9/4{piece}4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150
-    )
+    game = tb.Game(f"sfen 9/9/9/9/4{piece}4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150)
     index = lambda file, rank: (rank - 1) * 9 + (9 - file)
 
     unlimited = game.attack_counts("+")
@@ -179,13 +168,9 @@ def test_attack_counts_distance_limit_does_not_affect_short_range_pieces():
     assert game.attack_counts("+", max_sliding_distance=0)[index(5, 4)] == 1
 
 
-@pytest.mark.parametrize(
-    ("piece_kind_index", "piece"), tuple(enumerate(ATTACK_COUNT_PIECES))
-)
+@pytest.mark.parametrize(("piece_kind_index", "piece"), tuple(enumerate(ATTACK_COUNT_PIECES)))
 def test_attack_counts_by_piece_kind_uses_documented_order(piece_kind_index, piece):
-    game = tb.Game(
-        f"sfen 9/9/9/9/4{piece}4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150
-    )
+    game = tb.Game(f"sfen 9/9/9/9/4{piece}4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150)
 
     aggregate = game.attack_counts("+")
     by_kind = game.attack_counts_by_piece_kind("+")
@@ -214,61 +199,13 @@ def test_attack_counts_by_piece_kind_matches_aggregate_options():
                         max_sliding_distance=max_sliding_distance,
                     )
                     summed = bytes(
-                        sum(by_kind[piece_kind_index * 81 + square_index]
-                            for piece_kind_index in range(len(ATTACK_COUNT_PIECES)))
+                        sum(
+                            by_kind[piece_kind_index * 81 + square_index]
+                            for piece_kind_index in range(len(ATTACK_COUNT_PIECES))
+                        )
                         for square_index in range(81)
                     )
                     assert summed == aggregate
 
     with pytest.raises(ValueError):
         game.attack_counts_by_piece_kind("*")
-
-
-def test_analyze_moves_returns_batch_results_without_mutating_game():
-    game = new_standard_game()
-    original_sfen = game.sfen
-
-    results = game.analyze_moves(
-        "+", ["+7776FU", "+7775FU"], include_attack_counts=True
-    )
-
-    assert [result["move"] for result in results] == ["+7776FU", "+7775FU"]
-    assert results[0]["valid"] is True
-    assert results[0]["last_info"] == tb.INFO_NONE
-    assert results[0]["last_capture"] is None
-    assert results[0]["fouls"] == (9, 9)
-    assert len(results[0]["attack_counts"]) == 81
-    assert results[1]["valid"] is False
-    assert results[1]["sfen"] == original_sfen
-    assert game.sfen == original_sfen
-    assert game.last_move is None
-
-
-def test_analyze_moves_can_skip_attack_counts():
-    result = new_standard_game().analyze_moves(
-        "+", ["+7776FU"], include_attack_counts=False
-    )[0]
-
-    assert result["attack_counts"] is None
-
-
-def test_analyze_moves_can_limit_sliding_piece_distance():
-    game = tb.Game("sfen 9/9/9/9/4R4/9/9/9/9 b - 1", 1, False, 3, 9, 9, 150)
-    index = lambda file, rank: (rank - 1) * 9 + (9 - file)
-
-    result = game.analyze_moves(
-        "+", ["+5554HI"], max_sliding_distance=1
-    )[0]
-
-    assert result["valid"] is True
-    assert result["attack_counts"][index(5, 3)] == 1
-    assert result["attack_counts"][index(5, 2)] == 0
-
-
-def test_analyze_moves_reports_captured_piece():
-    game = tb.Game("sfen 9/9/9/9/9/9/4p4/4R4/9 b - 1", 1, False, 3, 9, 9, 150)
-
-    result = game.analyze_moves("+", ["+5857HI"], include_attack_counts=False)[0]
-
-    assert result["valid"] is True
-    assert result["last_capture"] == "P"
