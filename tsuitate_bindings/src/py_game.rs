@@ -241,6 +241,7 @@ impl PyGame {
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGame>()?;
+    m.add_class::<crate::selfplay::PySelfPlayBatch>()?;
     m.add("INFO_NONE", Info::None as u8)?;
     m.add("INFO_FOUL", Info::Foul as u8)?;
     m.add("INFO_FOUL_UNDER_CHECK", Info::FoulUnderCheck as u8)?;

@@ -2,6 +2,8 @@ mod game_api;
 #[cfg(feature = "python")]
 mod py_game;
 mod rl;
+#[cfg(feature = "python")]
+mod selfplay;
 mod sfen_util;
 mod wasm_game;
 
