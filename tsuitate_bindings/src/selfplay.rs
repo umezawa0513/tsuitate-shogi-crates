@@ -26,6 +26,7 @@ enum PlaneWriter {
     HandAtLeast(PieceKind, u8),
     OpponentFoulAtLeast(u8),
     SelfFoulAtLeast(u8),
+    OpponentLastTurnFoul,
     LastRealTo(PieceKind),
     Capture(PieceKind),
     LastFoulFrom,
@@ -58,6 +59,7 @@ impl PlaneWriter {
             ["hand_ge", piece, threshold] => Ok(Self::HandAtLeast(kind(piece)?, level(threshold)?)),
             ["opp_foul_ge", threshold] => Ok(Self::OpponentFoulAtLeast(level(threshold)?)),
             ["self_foul_ge", threshold] => Ok(Self::SelfFoulAtLeast(level(threshold)?)),
+            ["opp_last_turn_foul"] => Ok(Self::OpponentLastTurnFoul),
             ["last_real_to", piece] => Ok(Self::LastRealTo(kind(piece)?)),
             ["capture", piece] => Ok(Self::Capture(kind(piece)?)),
             ["last_foul_from"] => Ok(Self::LastFoulFrom),
@@ -167,6 +169,10 @@ impl DriverConfig {
 #[derive(Clone, Default)]
 struct SideState {
     self_last_check: bool,
+    // 進行中のターンで反則があったか。本手でターンを閉じるときに last_turn_fouled へ移す。
+    turn_fouled: bool,
+    // 直前に完了したこのプレイヤーのターンに反則があったか。相手がこれを観測する。
+    last_turn_fouled: bool,
     last_real_move: Option<Move>,
     last_real_kind: Option<PieceKind>,
     last_real_promoted: bool,
@@ -303,6 +309,7 @@ impl GameSlot {
         let mut frame = vec![0.0; config.writers.len() * config.square_count];
         let color_index = DriverConfig::color_index(color);
         let side = &self.side[color_index];
+        let opponent_side = &self.side[1 - color_index];
         let info = self.game.last_info();
         let attack_counts = self.game.attack_counts(color, true, None);
         let piece_attack_counts = self.game.attack_counts_by_piece_kind(color, true, None);
@@ -404,6 +411,11 @@ impl GameSlot {
                 }
                 PlaneWriter::SelfFoulAtLeast(threshold) => {
                     if self_foul_count >= threshold {
+                        Self::fill_channel(&mut frame, channel, config, 1.0);
+                    }
+                }
+                PlaneWriter::OpponentLastTurnFoul => {
+                    if opponent_side.last_turn_fouled {
                         Self::fill_channel(&mut frame, channel, config, 1.0);
                     }
                 }
@@ -694,12 +706,15 @@ impl GameSlot {
                 .ok_or_else(|| "engine accepted an action without last_info".to_string())?;
             self.side[side_index].self_last_check = info == Info::Check;
             if matches!(info, Info::Foul | Info::FoulUnderCheck) {
+                self.side[side_index].turn_fouled = true;
                 if config.foul_mask {
                     for equivalent in config.same_foul_class(action) {
                         self.foul_excluded[equivalent] = true;
                     }
                 }
             } else {
+                self.side[side_index].last_turn_fouled = self.side[side_index].turn_fouled;
+                self.side[side_index].turn_fouled = false;
                 self.foul_excluded.fill(false);
                 let kind = self
                     .game
