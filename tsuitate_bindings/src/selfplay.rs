@@ -14,6 +14,50 @@ use tsuitate_game::{Info, csa_to_piece_kind};
 use crate::game_api::{ATTACK_COUNT_PIECE_KINDS, GameApi};
 use crate::rl::{action_index_to_move, legal_action_indices_for_position};
 
+// PieceKind は 14 種で、並びに同じ駒種は入らないので、並びは 14 要素までの固定長の表に
+// 収まる。PlaneWriter が Copy のまま持てる。
+const MAX_KIND_ORDER: usize = 14;
+
+// Python が writer 名に載せる駒種の並び (PIECE_KINDS・DROP_KINDS に当たる)。
+// 値は並びの中の index と並びの長さから作り、盤面の駒種表は Rust に持たせない。
+#[derive(Clone, Copy, Debug)]
+struct KindOrder {
+    kinds: [Option<PieceKind>; MAX_KIND_ORDER],
+    len: usize,
+}
+
+impl KindOrder {
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut order = Self {
+            kinds: [None; MAX_KIND_ORDER],
+            len: 0,
+        };
+        for name in text.split(',') {
+            let kind = csa_to_piece_kind(name)
+                .map_err(|_| format!("unknown piece kind {name:?} in {text:?}"))?;
+            if order.len == MAX_KIND_ORDER || order.position(kind).is_some() {
+                return Err(format!("invalid piece kind order {text:?}"));
+            }
+            order.kinds[order.len] = Some(kind);
+            order.len += 1;
+        }
+        Ok(order)
+    }
+
+    // 並びの中の index。並びに無い駒種は None。
+    fn position(&self, kind: PieceKind) -> Option<usize> {
+        self.kinds[..self.len]
+            .iter()
+            .position(|candidate| *candidate == Some(kind))
+    }
+
+    // (index + 1) / 並びの長さ。Python は f64 で計算して float32 の配列へ代入するので、
+    // 呼び出し側も f64 のまま足し引きしてから f32 にする。
+    fn ratio(&self, index: usize) -> f64 {
+        (index + 1) as f64 / self.len as f64
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PlaneWriter {
     Board(PieceKind),
@@ -36,6 +80,10 @@ enum PlaneWriter {
     LastRealFrom,
     MyCapture(PieceKind),
     LastRealToPromoted(PieceKind),
+    LastFoulMove,
+    CaptureKinded(KindOrder),
+    LastRealMoveWithPromotion(KindOrder, KindOrder),
+    MyCaptureKinded(KindOrder),
 }
 
 impl PlaneWriter {
@@ -69,6 +117,15 @@ impl PlaneWriter {
             ["last_real_from"] => Ok(Self::LastRealFrom),
             ["my_capture", piece] => Ok(Self::MyCapture(kind(piece)?)),
             ["last_real_to_promoted", piece] => Ok(Self::LastRealToPromoted(kind(piece)?)),
+            ["last_foul_move"] => Ok(Self::LastFoulMove),
+            ["capture_kinded", drops] => Ok(Self::CaptureKinded(KindOrder::parse(drops)?)),
+            ["last_real_move_with_promotion", pieces, drops] => {
+                Ok(Self::LastRealMoveWithPromotion(
+                    KindOrder::parse(pieces)?,
+                    KindOrder::parse(drops)?,
+                ))
+            }
+            ["my_capture_kinded", drops] => Ok(Self::MyCaptureKinded(KindOrder::parse(drops)?)),
             _ => Err(format!("unknown observation plane writer {value:?}")),
         }
     }
@@ -470,6 +527,57 @@ impl GameSlot {
                         && let Some(mv) = side.last_real_move
                     {
                         let value = if side.last_real_promoted { 2.0 } else { 1.0 };
+                        Self::write_square(&mut frame, channel, move_to(mv), color, config, value);
+                    }
+                }
+                PlaneWriter::LastFoulMove => match my_last_move {
+                    Some(Move::Normal { from, to, .. }) => {
+                        Self::write_square(&mut frame, channel, from, color, config, -1.0);
+                        Self::write_square(&mut frame, channel, to, color, config, 1.0);
+                    }
+                    Some(Move::Drop { to, .. }) => {
+                        Self::write_square(&mut frame, channel, to, color, config, 2.0);
+                    }
+                    None => {}
+                },
+                PlaneWriter::CaptureKinded(order) => {
+                    if let Some(kind) = self.last_capture_kind
+                        && let Some(index) = order.position(kind)
+                        && let Some(square) = self.last_capture_to
+                    {
+                        let value = order.ratio(index) as f32;
+                        Self::write_square(&mut frame, channel, square, color, config, value);
+                    }
+                }
+                PlaneWriter::LastRealMoveWithPromotion(piece_order, drop_order) => {
+                    match side.last_real_move {
+                        Some(Move::Normal { from, to, .. }) => {
+                            let from_value = if side.last_real_promoted { -0.5 } else { -1.0 };
+                            let to_value = side
+                                .last_real_kind
+                                .and_then(|kind| piece_order.position(kind))
+                                .map_or(1.0, |index| piece_order.ratio(index) as f32);
+                            Self::write_square(
+                                &mut frame, channel, from, color, config, from_value,
+                            );
+                            Self::write_square(&mut frame, channel, to, color, config, to_value);
+                        }
+                        Some(Move::Drop { to, .. }) => {
+                            let value = side
+                                .last_real_kind
+                                .and_then(|kind| drop_order.position(kind))
+                                .map_or(2.0, |index| (2.0 + drop_order.ratio(index)) as f32);
+                            Self::write_square(&mut frame, channel, to, color, config, value);
+                        }
+                        None => {}
+                    }
+                }
+                PlaneWriter::MyCaptureKinded(order) => {
+                    if let Some(kind) = side.my_capture_kind
+                        && let Some(index) = order.position(kind)
+                        && let Some(mv) = side.last_real_move
+                    {
+                        let value = order.ratio(index) as f32;
                         Self::write_square(&mut frame, channel, move_to(mv), color, config, value);
                     }
                 }
