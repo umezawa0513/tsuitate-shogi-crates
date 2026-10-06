@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use numpy::ndarray::{Array1, Array2, Array4};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray4};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray4, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -167,6 +167,9 @@ struct DriverConfig {
     real_history_channels: Vec<usize>,
     current_channels: Vec<usize>,
     input_channels: usize,
+    // apply_batch が step ごとに受け取り、take_records で返す f32 の個数。中身は Python が決め、
+    // Rust は解釈しない。
+    step_payload_width: usize,
 }
 
 impl DriverConfig {
@@ -374,6 +377,7 @@ struct GameBuffers {
     move_counts: Vec<u16>,
     infos: Vec<u8>,
     behavior_probs: Vec<f32>,
+    step_payload: Vec<f32>,
 }
 
 impl GameBuffers {
@@ -957,6 +961,7 @@ impl GameSlot {
         &mut self,
         action: usize,
         behavior_prob: f32,
+        step_payload: &[f32],
         config: &DriverConfig,
     ) -> Result<(i8, u8, u8), String> {
         let pending = self
@@ -1075,6 +1080,7 @@ impl GameSlot {
         self.buffers.move_counts.push(pending.move_count);
         self.buffers.infos.push(info as u8);
         self.buffers.behavior_probs.push(behavior_prob);
+        self.buffers.step_payload.extend_from_slice(step_payload);
         let done = u8::from(result_black.is_some());
         let reward = match result_black {
             Some(0) | None => 0,
@@ -1157,7 +1163,8 @@ impl PySelfPlayBatch {
         real_history_frames,
         real_history_channels,
         current_channels,
-        thread_count=None
+        thread_count=None,
+        step_payload_width=0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1190,6 +1197,7 @@ impl PySelfPlayBatch {
         real_history_channels: Vec<usize>,
         current_channels: Vec<usize>,
         thread_count: Option<usize>,
+        step_payload_width: usize,
     ) -> PyResult<Self> {
         if game_count == 0 {
             return Err(PyValueError::new_err("game_count must be positive"));
@@ -1324,6 +1332,7 @@ impl PySelfPlayBatch {
             real_history_channels,
             current_channels,
             input_channels,
+            step_payload_width,
         };
         let pool = thread_count
             .map(|threads| {
@@ -1480,11 +1489,13 @@ impl PySelfPlayBatch {
         Ok(result)
     }
 
+    #[pyo3(signature = (actions, behavior_probs, step_payload=None))]
     fn apply_batch<'py>(
         &mut self,
         py: Python<'py>,
         actions: Vec<usize>,
         behavior_probs: Vec<f32>,
+        step_payload: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<(
         Bound<'py, PyArray1<i8>>,
         Bound<'py, PyArray1<u8>>,
@@ -1496,20 +1507,40 @@ impl PySelfPlayBatch {
                 "actions and behavior_probs must match the observed batch length",
             ));
         }
+        let width = self.config.step_payload_width;
+        let step_payload: Vec<f32> = match step_payload {
+            Some(array) => {
+                let view = array.as_array();
+                if view.dim() != (actions.len(), width) {
+                    return Err(PyValueError::new_err(
+                        "step_payload must have shape (observed batch length, step_payload_width)",
+                    ));
+                }
+                view.iter().copied().collect()
+            }
+            None if width == 0 => Vec::new(),
+            None => {
+                return Err(PyValueError::new_err(
+                    "step_payload is required when step_payload_width is positive",
+                ));
+            }
+        };
         let mut action_by_slot = vec![None; self.batch_size];
         for (row, slot_index) in self.pending_slots.iter().copied().enumerate() {
-            action_by_slot[slot_index] = Some((actions[row], behavior_probs[row]));
+            action_by_slot[slot_index] = Some((actions[row], behavior_probs[row], row));
         }
         let config = &self.config;
         let slots = &mut self.slots;
+        let step_payload = &step_payload;
         let mut apply = || {
             slots
                 .par_iter_mut()
                 .enumerate()
                 .filter_map(|(slot_index, slot)| {
-                    let (action, probability) = action_by_slot[slot_index]?;
+                    let (action, probability, row) = action_by_slot[slot_index]?;
+                    let payload = &step_payload[row * width..(row + 1) * width];
                     Some(match slot.as_mut() {
-                        Some(slot) => slot.apply(action, probability, config),
+                        Some(slot) => slot.apply(action, probability, payload, config),
                         None => Err("observed slot disappeared before apply".to_string()),
                     })
                 })
@@ -1565,6 +1596,7 @@ impl PySelfPlayBatch {
         let mut move_counts = Vec::new();
         let mut infos = Vec::new();
         let mut behavior_probs = Vec::new();
+        let mut step_payloads = Vec::new();
         let mut rewards = Vec::new();
         let mut offsets = Vec::with_capacity(self.game_count + 1);
         let mut results = Vec::with_capacity(self.game_count);
@@ -1587,6 +1619,7 @@ impl PySelfPlayBatch {
             move_counts.extend(finished.buffers.move_counts);
             infos.extend(finished.buffers.infos);
             behavior_probs.extend(finished.buffers.behavior_probs);
+            step_payloads.extend(finished.buffers.step_payload);
             let previous = rewards.len();
             rewards.resize(previous + steps, 0.0);
             if steps > 0 {
@@ -1630,6 +1663,12 @@ impl PySelfPlayBatch {
         packed.set_item(
             "behavior_probs",
             Array1::from_vec(behavior_probs).into_pyarray(py),
+        )?;
+        packed.set_item(
+            "step_payload",
+            Array2::from_shape_vec((total_steps, self.config.step_payload_width), step_payloads)
+                .expect("packed step payload shape is internally consistent")
+                .into_pyarray(py),
         )?;
         packed.set_item("rewards", Array1::from_vec(rewards).into_pyarray(py))?;
         packed.set_item("offsets", Array1::from_vec(offsets).into_pyarray(py))?;
