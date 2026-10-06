@@ -84,6 +84,7 @@ enum PlaneWriter {
     CaptureKinded(KindOrder),
     LastRealMoveWithPromotion(KindOrder, KindOrder),
     MyCaptureKinded(KindOrder),
+    KingCandidate,
 }
 
 impl PlaneWriter {
@@ -126,6 +127,7 @@ impl PlaneWriter {
                 ))
             }
             ["my_capture_kinded", drops] => Ok(Self::MyCaptureKinded(KindOrder::parse(drops)?)),
+            ["king_candidate"] => Ok(Self::KingCandidate),
             _ => Err(format!("unknown observation plane writer {value:?}")),
         }
     }
@@ -156,6 +158,8 @@ struct DriverConfig {
     output_to_engine_square: Vec<usize>,
     engine_to_output_square: Vec<Option<usize>>,
     writers: Vec<PlaneWriter>,
+    // king_candidate writer を選んだときだけ、着手前後の自駒・利きを取る。
+    king_candidate: bool,
     assemble_inputs: bool,
     history_frames: usize,
     history_channels: Vec<usize>,
@@ -234,6 +238,128 @@ struct SideState {
     last_real_kind: Option<PieceKind>,
     last_real_promoted: bool,
     my_capture_kind: Option<PieceKind>,
+    // このプレイヤーの王手の本手で作った相手玉の推定位置 (出力 square 順)。次の
+    // このプレイヤーの着手 (反則を含む) で作り直すか消す。
+    king_candidate: Option<Vec<f32>>,
+}
+
+// 手番側から見た自駒と、自駒の利き (近・遠)。出力 square 順。
+struct OwnView {
+    kinds: Vec<Option<PieceKind>>,
+    near: Vec<f32>,
+    far: Vec<f32>,
+}
+
+// attacks.reach_from_game の _NEAR_SCALE / _FAR_SCALE (np.float32)。
+const REACH_NEAR_SCALE: f32 = (1.0_f64 / 6.0) as f32;
+const REACH_FAR_SCALE: f32 = (1.0_f64 / 4.0) as f32;
+// observation.compute_reach の _REACH_FAR_STEP。
+const REACH_FAR_STEP: f32 = 1.0 / 4.0;
+
+const DIAG4: [(isize, isize); 4] = [(1, -1), (-1, -1), (1, 1), (-1, 1)];
+const ORTHO4: [(isize, isize); 4] = [(0, -1), (0, 1), (1, 0), (-1, 0)];
+// observation.apply_capture_king_heuristic_planes の周囲 8 マス。
+const NEIGHBORS8: [(isize, isize); 8] = [
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+];
+
+// observation._REACH_SPEC の slide 方向 (手番側視点、前 = rank 減)。
+fn slide_directions(kind: PieceKind) -> &'static [(isize, isize)] {
+    match kind {
+        PieceKind::Lance => &[(0, -1)],
+        PieceKind::Bishop | PieceKind::ProBishop => &DIAG4,
+        PieceKind::Rook | PieceKind::ProRook => &ORTHO4,
+        _ => &[],
+    }
+}
+
+// 出力 square (file index * board_size + rank index) を 1 つ動かした先。盤外は None。
+fn step_square(index: usize, delta: (isize, isize), board_size: usize) -> Option<usize> {
+    let size = board_size as isize;
+    let file = (index / board_size) as isize + delta.0;
+    let rank = (index % board_size) as isize + delta.1;
+    if (0..size).contains(&file) && (0..size).contains(&rank) {
+        Some(file as usize * board_size + rank as usize)
+    } else {
+        None
+    }
+}
+
+// observation.compute_reach の遠い側 (slide の 2 マス目以降)。遮るのは pieces の駒だけ。
+// king_candidate_at_check_from_context は近い側を使わないので作らない。
+fn moved_far_reach(pieces: &[(usize, PieceKind)], board_size: usize) -> Vec<f32> {
+    let mut far = vec![0.0_f32; board_size * board_size];
+    for (origin, kind) in pieces.iter().copied() {
+        for delta in slide_directions(kind).iter().copied() {
+            let mut square = step_square(origin, delta, board_size);
+            let mut step = 1;
+            while let Some(index) = square {
+                if step >= 2 {
+                    far[index] += REACH_FAR_STEP;
+                }
+                if pieces.iter().any(|(occupied, _)| *occupied == index) {
+                    break;
+                }
+                square = step_square(index, delta, board_size);
+                step += 1;
+            }
+        }
+    }
+    for value in &mut far {
+        *value = value.clamp(0.0, 1.0);
+    }
+    far
+}
+
+// observation.king_candidate_at_check_from_context。
+fn king_candidate_at_check(before: &OwnView, after: &OwnView, board_size: usize) -> Vec<f32> {
+    let square_count = board_size * board_size;
+    let mut far_increase: Vec<bool> = (0..square_count)
+        .map(|index| after.far[index] > before.far[index])
+        .collect();
+    let moved = |from: &OwnView, to: &OwnView| -> Vec<(usize, PieceKind)> {
+        (0..square_count)
+            .filter_map(|index| {
+                from.kinds[index]
+                    .filter(|kind| to.kinds[index] != Some(*kind))
+                    .map(|kind| (index, kind))
+            })
+            .collect()
+    };
+    let moved_from = moved(before, after);
+    let moved_to = moved(after, before);
+    if !moved_from.is_empty() || !moved_to.is_empty() {
+        let reach_from = moved_far_reach(&moved_from, board_size);
+        let reach_to = moved_far_reach(&moved_to, board_size);
+        for index in 0..square_count {
+            far_increase[index] |= reach_to[index] > 0.0;
+            far_increase[index] |= (after.far[index] - reach_to[index]).max(0.0)
+                > (before.far[index] - reach_from[index]).max(0.0);
+        }
+    }
+    (0..square_count)
+        .map(|index| {
+            if before.near[index] > 0.0
+                || before.kinds[index].is_some()
+                || after.kinds[index].is_some()
+            {
+                0.0
+            } else if after.near[index] > 0.0 {
+                1.0
+            } else if far_increase[index] {
+                0.5
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -360,6 +486,68 @@ impl GameSlot {
         let row = square.rank() as usize - 1;
         let column = config.board_size - square.file() as usize;
         raw[row * config.board_size + column]
+    }
+
+    // attacks.reach_from_game と env._own_board を、king_candidate が使う形で取る。
+    fn own_view(&self, color: Color, config: &DriverConfig) -> OwnView {
+        let all_counts = self.game.attack_counts(color, true, None);
+        let near_counts = self.game.attack_counts(color, true, Some(1));
+        let mut view = OwnView {
+            kinds: vec![None; config.square_count],
+            near: vec![0.0; config.square_count],
+            far: vec![0.0; config.square_count],
+        };
+        for square in Square::all() {
+            let Some(index) = config.output_square(square, color) else {
+                continue;
+            };
+            let near = Self::attack_value(&near_counts, square, config);
+            let all = Self::attack_value(&all_counts, square, config);
+            view.near[index] = (near as f32 * REACH_NEAR_SCALE).clamp(0.0, 1.0);
+            view.far[index] = ((all as i16 - near as i16) as f32 * REACH_FAR_SCALE).clamp(0.0, 1.0);
+            view.kinds[index] = self
+                .game
+                .position()
+                .piece_at(square)
+                .filter(|piece| piece.color() == color)
+                .map(|piece| piece.piece_kind());
+        }
+        view
+    }
+
+    // observation.apply_capture_king_heuristic_planes: 王手した駒を玉が取ったなら、
+    // 取られたマスに玉がいる。
+    fn king_candidate_with_capture(
+        &self,
+        king: &[f32],
+        color: Color,
+        config: &DriverConfig,
+    ) -> Vec<f32> {
+        let mut king = king.to_vec();
+        if self.last_capture_kind.is_none() {
+            return king;
+        }
+        let Some(square) = self.last_capture_to else {
+            return king;
+        };
+        let Some(index) = config.output_square(square, color) else {
+            return king;
+        };
+        let near_counts = self.game.attack_counts(color, true, Some(1));
+        let occupied = self
+            .game
+            .position()
+            .piece_at(square)
+            .is_some_and(|piece| piece.color() == color);
+        if Self::attack_value(&near_counts, square, config) > 0 || occupied {
+            return king;
+        }
+        if NEIGHBORS8.iter().any(|delta| {
+            step_square(index, *delta, config.board_size).is_some_and(|near| king[near] > 0.0)
+        }) {
+            king[index] = 1.0;
+        }
+        king
     }
 
     fn encode_frame(&self, color: Color, config: &DriverConfig) -> Vec<f32> {
@@ -581,6 +769,13 @@ impl GameSlot {
                         Self::write_square(&mut frame, channel, move_to(mv), color, config, value);
                     }
                 }
+                PlaneWriter::KingCandidate => {
+                    if let Some(king) = &side.king_candidate {
+                        let king = self.king_candidate_with_capture(king, color, config);
+                        let start = channel * config.square_count;
+                        frame[start..start + config.square_count].copy_from_slice(&king);
+                    }
+                }
             }
         }
         frame
@@ -791,6 +986,11 @@ impl GameSlot {
         let is_banned_first_move = config.first_move_foul_loss
             && pending.first_move
             && config.banned_first_actions.contains(&action);
+        // env は手番側の観測ごとに盤面・利きを控える。観測から着手までは局面が
+        // 変わらないので、着手直前に取っても同じ。
+        let before = config
+            .king_candidate
+            .then(|| self.own_view(pending.color, config));
         let moved = self.game.make_move_raw(mv);
         self.ply = self.ply.saturating_add(1);
 
@@ -806,6 +1006,7 @@ impl GameSlot {
             for equivalent in config.same_foul_class(action) {
                 self.foul_excluded[equivalent] = true;
             }
+            self.side[side_index].king_candidate = None;
             (Info::None, None)
         } else {
             let info = self
@@ -848,6 +1049,13 @@ impl GameSlot {
                     self.last_capture_to = None;
                 }
             }
+            self.side[side_index].king_candidate = match before {
+                Some(before) if info == Info::Check => {
+                    let after = self.own_view(pending.color, config);
+                    Some(king_candidate_at_check(&before, &after, config.board_size))
+                }
+                _ => None,
+            };
             let result = match info {
                 Info::Checkmate => Some(if pending.color == Color::Black { 1 } else { -1 }),
                 Info::LossByFoul => Some(if pending.color == Color::Black { -1 } else { 1 }),
@@ -1045,6 +1253,9 @@ impl PySelfPlayBatch {
             .map(|(name, _)| PlaneWriter::parse(name))
             .collect::<Result<Vec<_>, _>>()
             .map_err(PyValueError::new_err)?;
+        let king_candidate = writers
+            .iter()
+            .any(|writer| matches!(writer, PlaneWriter::KingCandidate));
         if history_channels
             .iter()
             .chain(real_history_channels.iter())
@@ -1105,6 +1316,7 @@ impl PySelfPlayBatch {
             output_to_engine_square,
             engine_to_output_square,
             writers,
+            king_candidate,
             assemble_inputs,
             history_frames,
             history_channels,
