@@ -378,6 +378,7 @@ struct GameBuffers {
     infos: Vec<u8>,
     behavior_probs: Vec<f32>,
     step_payload: Vec<f32>,
+    opponent_board: Vec<u8>,
 }
 
 impl GameBuffers {
@@ -395,6 +396,7 @@ struct PendingStep {
     ply: u16,
     move_count: u16,
     first_move: bool,
+    opponent_board: Vec<u8>,
 }
 
 struct GameSlot {
@@ -517,6 +519,31 @@ impl GameSlot {
                 .map(|piece| piece.piece_kind());
         }
         view
+    }
+
+    // 手番側から見た相手駒の配置 (出力 square 順)。0 は相手駒なし、それ以外は
+    // ATTACK_COUNT_PIECE_KINDS の index + 1。belief の学習目標に使う。
+    fn opponent_board(&self, color: Color, config: &DriverConfig) -> Vec<u8> {
+        let mut board = vec![0u8; config.square_count];
+        for square in Square::all() {
+            let Some(index) = config.output_square(square, color) else {
+                continue;
+            };
+            let Some(piece) = self
+                .game
+                .position()
+                .piece_at(square)
+                .filter(|piece| piece.color() != color)
+            else {
+                continue;
+            };
+            let kind_index = ATTACK_COUNT_PIECE_KINDS
+                .iter()
+                .position(|candidate| *candidate == piece.piece_kind())
+                .expect("every piece kind has an attack plane");
+            board[index] = (kind_index + 1) as u8;
+        }
+        board
     }
 
     // observation.apply_capture_king_heuristic_planes: 王手した駒を玉が取ったなら、
@@ -918,6 +945,7 @@ impl GameSlot {
         }
         let color = self.game.position().side_to_move();
         let frame = self.encode_frame(color, config);
+        let opponent_board = self.opponent_board(color, config);
         let mask = self.legal_mask(color, config);
         if !mask.iter().any(|allowed| *allowed != 0) {
             self.result_black = Some(if color == Color::Black { -1 } else { 1 });
@@ -944,6 +972,7 @@ impl GameSlot {
             ply: self.ply,
             move_count,
             first_move,
+            opponent_board,
         });
         Ok(Some(ObservationRow {
             slot_index,
@@ -1071,6 +1100,7 @@ impl GameSlot {
         };
 
         self.buffers.frame_bits.extend(pending.frame_bits);
+        self.buffers.opponent_board.extend(pending.opponent_board);
         self.buffers.masks.extend(pending.mask);
         self.buffers.actions.push(action as i16);
         self.buffers.players.push(side_index as u8);
@@ -1597,6 +1627,7 @@ impl PySelfPlayBatch {
         let mut infos = Vec::new();
         let mut behavior_probs = Vec::new();
         let mut step_payloads = Vec::new();
+        let mut opponent_boards = Vec::new();
         let mut rewards = Vec::new();
         let mut offsets = Vec::with_capacity(self.game_count + 1);
         let mut results = Vec::with_capacity(self.game_count);
@@ -1620,6 +1651,7 @@ impl PySelfPlayBatch {
             infos.extend(finished.buffers.infos);
             behavior_probs.extend(finished.buffers.behavior_probs);
             step_payloads.extend(finished.buffers.step_payload);
+            opponent_boards.extend(finished.buffers.opponent_board);
             let previous = rewards.len();
             rewards.resize(previous + steps, 0.0);
             if steps > 0 {
@@ -1668,6 +1700,12 @@ impl PySelfPlayBatch {
             "step_payload",
             Array2::from_shape_vec((total_steps, self.config.step_payload_width), step_payloads)
                 .expect("packed step payload shape is internally consistent")
+                .into_pyarray(py),
+        )?;
+        packed.set_item(
+            "opponent_board",
+            Array2::from_shape_vec((total_steps, self.config.square_count), opponent_boards)
+                .expect("packed opponent board shape is internally consistent")
                 .into_pyarray(py),
         )?;
         packed.set_item("rewards", Array1::from_vec(rewards).into_pyarray(py))?;
