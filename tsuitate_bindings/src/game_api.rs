@@ -147,6 +147,11 @@ impl GameApi {
         self.inner.last_move
     }
 
+    /// 途中局面から始めるときに、直前の手 (手番側自身の反則の手) を入れる。
+    pub(crate) fn set_last_move(&mut self, mv: Option<Move>) {
+        self.inner.last_move = mv;
+    }
+
     pub(crate) fn last_move_csa(&self, viewpoint: Option<Color>) -> Option<String> {
         let mv = self.last_move()?;
         let color = infer_last_move_color(self, &mv);

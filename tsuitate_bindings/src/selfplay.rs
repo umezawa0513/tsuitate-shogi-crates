@@ -9,7 +9,7 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 use shogi_core::{Color, Move, Piece, PieceKind, Square};
 use shogi_legality_extended::Setting;
-use tsuitate_game::{Info, csa_to_piece_kind};
+use tsuitate_game::{Info, csa_to_move, csa_to_piece_kind};
 
 use crate::game_api::{ATTACK_COUNT_PIECE_KINDS, GameApi};
 use crate::rl::{action_index_to_move, legal_action_indices_for_position};
@@ -170,6 +170,8 @@ struct DriverConfig {
     // apply_batch が step ごとに受け取り、take_records で返す f32 の個数。中身は Python が決め、
     // Rust は解釈しない。
     step_payload_width: usize,
+    // 局ごとの開始状態。None なら全局 initial_sfen の初期局面から始める。
+    initial_states: Option<Vec<InitialState>>,
 }
 
 impl DriverConfig {
@@ -241,9 +243,159 @@ struct SideState {
     last_real_kind: Option<PieceKind>,
     last_real_promoted: bool,
     my_capture_kind: Option<PieceKind>,
+    // 直前の本手の行き先 (取った駒の面が位置に使う)。本手のたびに last_real_move と一緒に入れる。
+    // 途中局面から始めるとき、相手の直前の本手は見えないが、駒を取ったマスは見えるので、
+    // last_real_move とは別に持つ。
+    my_capture_to: Option<Square>,
     // このプレイヤーの王手の本手で作った相手玉の推定位置 (出力 square 順)。次の
     // このプレイヤーの着手 (反則を含む) で作り直すか消す。
     king_candidate: Option<Vec<f32>>,
+}
+
+// 途中局面から始める局の、Python から受け取る状態 (initial_states の 1 要素)。マスは絶対座標の
+// (筋, 段)、駒種は CSA の文字列。
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct PySideToMoveStart {
+    self_last_check: bool,
+    turn_fouled: bool,
+    last_turn_fouled: bool,
+    // (移動元の筋, 段, 行き先の筋, 段)。駒打ちは移動元が (0, 0)。
+    last_real_move: Option<(u8, u8, u8, u8)>,
+    last_real_kind: Option<String>,
+    last_real_promoted: bool,
+    my_capture_kind: Option<String>,
+    my_capture_to: Option<(u8, u8)>,
+    king_candidate: Option<Vec<f32>>,
+}
+
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct PyOpponentStart {
+    self_last_check: bool,
+    last_turn_fouled: bool,
+    my_capture_kind: Option<String>,
+    my_capture_to: Option<(u8, u8)>,
+}
+
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct PyInitialState {
+    sfen: String,
+    fouls: (i8, i8),
+    last_info: Option<u8>,
+    // エンジンの直前の手 (手番側自身の反則の手のときだけ。CSA)。
+    last_move: Option<String>,
+    foul_excluded: Vec<usize>,
+    side_to_move: PySideToMoveStart,
+    opponent: PyOpponentStart,
+    // 共有の直前の駒取り (駒種, 盤上の駒種, マス)。
+    last_capture: Option<(String, String, (u8, u8))>,
+}
+
+#[derive(Clone)]
+struct InitialState {
+    game: GameApi,
+    side: [SideState; 2],
+    last_capture: Option<(PieceKind, PieceKind, Square)>,
+    foul_excluded: Vec<bool>,
+}
+
+fn start_square((file, rank): (u8, u8)) -> Result<Square, String> {
+    Square::new(file, rank).ok_or_else(|| format!("invalid square ({file}, {rank})"))
+}
+
+fn start_kind(kind: &str) -> Result<PieceKind, String> {
+    csa_to_piece_kind(kind).map_err(|_| format!("invalid piece kind {kind:?}"))
+}
+
+fn start_optional_kind(kind: Option<&String>) -> Result<Option<PieceKind>, String> {
+    kind.map(|kind| start_kind(kind)).transpose()
+}
+
+impl InitialState {
+    fn parse(state: PyInitialState, config: &DriverConfig) -> Result<Self, String> {
+        let mut game = GameApi::new(
+            &state.sfen,
+            config.game_kind,
+            !config.foul_free,
+            config.promotion_rank,
+            state.fouls.0,
+            state.fouls.1,
+            config.draw_move_count,
+            state.last_info,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(csa) = &state.last_move {
+            let mv = csa_to_move(csa, game.position())
+                .map_err(|_| format!("invalid last_move {csa:?}"))?;
+            game.set_last_move(Some(mv));
+        }
+        let color = game.position().side_to_move();
+        let mover = &state.side_to_move;
+        let last_real_kind = start_optional_kind(mover.last_real_kind.as_ref())?;
+        let last_real_move = match mover.last_real_move {
+            None => None,
+            Some((0, 0, to_file, to_rank)) => Some(Move::Drop {
+                piece: Piece::new(
+                    last_real_kind.ok_or("a dropped last_real_move needs last_real_kind")?,
+                    color,
+                ),
+                to: start_square((to_file, to_rank))?,
+            }),
+            Some((from_file, from_rank, to_file, to_rank)) => Some(Move::Normal {
+                from: start_square((from_file, from_rank))?,
+                to: start_square((to_file, to_rank))?,
+                promote: mover.last_real_promoted,
+            }),
+        };
+        if let Some(king) = &mover.king_candidate
+            && king.len() != config.square_count
+        {
+            return Err("king_candidate must have one value per square".to_string());
+        }
+        let side_to_move = SideState {
+            self_last_check: mover.self_last_check,
+            turn_fouled: mover.turn_fouled,
+            last_turn_fouled: mover.last_turn_fouled,
+            last_real_move,
+            last_real_kind,
+            last_real_promoted: mover.last_real_promoted,
+            my_capture_kind: start_optional_kind(mover.my_capture_kind.as_ref())?,
+            my_capture_to: mover.my_capture_to.map(start_square).transpose()?,
+            king_candidate: mover.king_candidate.clone(),
+        };
+        let opponent = SideState {
+            self_last_check: state.opponent.self_last_check,
+            last_turn_fouled: state.opponent.last_turn_fouled,
+            my_capture_kind: start_optional_kind(state.opponent.my_capture_kind.as_ref())?,
+            my_capture_to: state.opponent.my_capture_to.map(start_square).transpose()?,
+            ..SideState::default()
+        };
+        let mut side = [SideState::default(), SideState::default()];
+        side[DriverConfig::color_index(color)] = side_to_move;
+        side[DriverConfig::color_index(color.flip())] = opponent;
+        let last_capture = match &state.last_capture {
+            None => None,
+            Some((kind, board_kind, square)) => Some((
+                start_kind(kind)?,
+                start_kind(board_kind)?,
+                start_square(*square)?,
+            )),
+        };
+        let mut foul_excluded = vec![false; config.action_count];
+        for action in &state.foul_excluded {
+            *foul_excluded
+                .get_mut(*action)
+                .ok_or_else(|| format!("foul_excluded action {action} is out of range"))? = true;
+        }
+        Ok(Self {
+            game,
+            side,
+            last_capture,
+            foul_excluded,
+        })
+    }
 }
 
 // 手番側から見た自駒と、自駒の利き (近・遠)。出力 square 順。
@@ -429,6 +581,32 @@ struct ObservationRow {
 
 impl GameSlot {
     fn new(game_index: usize, config: &DriverConfig) -> Result<Self, String> {
+        if let Some(states) = &config.initial_states {
+            let state = states
+                .get(game_index)
+                .ok_or_else(|| format!("no initial state for game {game_index}"))?;
+            let (last_capture_kind, last_capture_board_kind, last_capture_to) =
+                match state.last_capture {
+                    Some((kind, board_kind, square)) => (Some(kind), Some(board_kind), Some(square)),
+                    None => (None, None, None),
+                };
+            return Ok(Self {
+                game_index,
+                game: state.game.clone(),
+                side: state.side.clone(),
+                history: std::array::from_fn(|_| VecDeque::new()),
+                real_history: std::array::from_fn(|_| VecDeque::new()),
+                real_last_move_count: [None, None],
+                last_capture_kind,
+                last_capture_board_kind,
+                last_capture_to,
+                foul_excluded: state.foul_excluded.clone(),
+                ply: 0,
+                pending: None,
+                buffers: GameBuffers::default(),
+                result_black: None,
+            });
+        }
         let game = GameApi::new(
             &config.initial_sfen,
             config.game_kind,
@@ -736,9 +914,9 @@ impl GameSlot {
                 }
                 PlaneWriter::MyCapture(kind) => {
                     if side.my_capture_kind == Some(kind)
-                        && let Some(mv) = side.last_real_move
+                        && let Some(square) = side.my_capture_to
                     {
-                        Self::write_square(&mut frame, channel, move_to(mv), color, config, 1.0);
+                        Self::write_square(&mut frame, channel, square, color, config, 1.0);
                     }
                 }
                 PlaneWriter::LastRealToPromoted(kind) => {
@@ -794,10 +972,10 @@ impl GameSlot {
                 PlaneWriter::MyCaptureKinded(order) => {
                     if let Some(kind) = side.my_capture_kind
                         && let Some(index) = order.position(kind)
-                        && let Some(mv) = side.last_real_move
+                        && let Some(square) = side.my_capture_to
                     {
                         let value = order.ratio(index) as f32;
-                        Self::write_square(&mut frame, channel, move_to(mv), color, config, value);
+                        Self::write_square(&mut frame, channel, square, color, config, value);
                     }
                 }
                 PlaneWriter::KingCandidate => {
@@ -1073,6 +1251,7 @@ impl GameSlot {
                 side.last_real_kind = kind;
                 side.last_real_promoted = promoted;
                 side.my_capture_kind = capture_kind;
+                side.my_capture_to = Some(move_to(mv));
                 if let Some(capture_kind) = capture_kind {
                     self.last_capture_kind = Some(capture_kind);
                     self.last_capture_board_kind = captured_board_kind.or(Some(capture_kind));
@@ -1194,7 +1373,8 @@ impl PySelfPlayBatch {
         real_history_channels,
         current_channels,
         thread_count=None,
-        step_payload_width=0
+        step_payload_width=0,
+        initial_states=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1228,6 +1408,7 @@ impl PySelfPlayBatch {
         current_channels: Vec<usize>,
         thread_count: Option<usize>,
         step_payload_width: usize,
+        initial_states: Option<Vec<PyInitialState>>,
     ) -> PyResult<Self> {
         if game_count == 0 {
             return Err(PyValueError::new_err("game_count must be positive"));
@@ -1330,7 +1511,7 @@ impl PySelfPlayBatch {
                 "first_move_foul_loss and foul_free cannot be enabled together",
             ));
         }
-        let config = DriverConfig {
+        let mut config = DriverConfig {
             initial_sfen,
             game_kind,
             promotion_rank,
@@ -1363,7 +1544,26 @@ impl PySelfPlayBatch {
             current_channels,
             input_channels,
             step_payload_width,
+            initial_states: None,
         };
+        if let Some(states) = initial_states {
+            if states.len() != game_count {
+                return Err(PyValueError::new_err(
+                    "initial_states must have game_count entries",
+                ));
+            }
+            if config.ban_first_moves || config.first_move_foul_loss {
+                return Err(PyValueError::new_err(
+                    "initial_states cannot be combined with ban_first_moves or first_move_foul_loss",
+                ));
+            }
+            let parsed = states
+                .into_iter()
+                .map(|state| InitialState::parse(state, &config))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PyValueError::new_err)?;
+            config.initial_states = Some(parsed);
+        }
         let pool = thread_count
             .map(|threads| {
                 rayon::ThreadPoolBuilder::new()
@@ -1410,6 +1610,21 @@ impl PySelfPlayBatch {
     #[getter]
     fn frame_channels(&self) -> usize {
         self.config.writers.len()
+    }
+
+    /// 局ごとの結果 (先手から見て 1・0・-1)。未終局の局は None。
+    fn results(&self) -> Vec<Option<i8>> {
+        let mut results: Vec<Option<i8>> = self
+            .finished
+            .iter()
+            .map(|game| game.as_ref().map(|game| game.result_black))
+            .collect();
+        for slot in self.slots.iter().flatten() {
+            if let Some(result) = slot.result_black {
+                results[slot.game_index] = Some(result);
+            }
+        }
+        results
     }
 
     fn observe_batch<'py>(
