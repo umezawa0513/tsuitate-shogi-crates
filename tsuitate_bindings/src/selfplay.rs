@@ -85,6 +85,12 @@ enum PlaneWriter {
     LastRealMoveWithPromotion(KindOrder, KindOrder),
     MyCaptureKinded(KindOrder),
     KingCandidate,
+    LastFoulMoveNoDrop,
+    KeptKingCandidateCertain,
+    KeptKingCandidateWithFar,
+    LastRealMoveNoDrop,
+    // (駒種, しきい値, 両者の合計)。合計は Python が名前に載せる (Rust は盤面の駒数の表を持たない)。
+    OpponentPieceAtLeast(PieceKind, u8, u8),
 }
 
 impl PlaneWriter {
@@ -96,6 +102,10 @@ impl PlaneWriter {
         let level = |text: &str| {
             text.parse::<u8>()
                 .map_err(|_| format!("invalid threshold {text:?}"))
+        };
+        let count = |text: &str| {
+            text.parse::<u8>()
+                .map_err(|_| format!("invalid piece count {text:?}"))
         };
         match parts.as_slice() {
             ["board", piece] => Ok(Self::Board(kind(piece)?)),
@@ -128,6 +138,15 @@ impl PlaneWriter {
             }
             ["my_capture_kinded", drops] => Ok(Self::MyCaptureKinded(KindOrder::parse(drops)?)),
             ["king_candidate"] => Ok(Self::KingCandidate),
+            ["last_foul_move_no_drop"] => Ok(Self::LastFoulMoveNoDrop),
+            ["kept_king_candidate_certain"] => Ok(Self::KeptKingCandidateCertain),
+            ["kept_king_candidate_with_far"] => Ok(Self::KeptKingCandidateWithFar),
+            ["last_real_move_no_drop"] => Ok(Self::LastRealMoveNoDrop),
+            ["opponent_piece_ge", piece, threshold, total] => Ok(Self::OpponentPieceAtLeast(
+                kind(piece)?,
+                level(threshold)?,
+                count(total)?,
+            )),
             _ => Err(format!("unknown observation plane writer {value:?}")),
         }
     }
@@ -158,7 +177,7 @@ struct DriverConfig {
     output_to_engine_square: Vec<usize>,
     engine_to_output_square: Vec<Option<usize>>,
     writers: Vec<PlaneWriter>,
-    // king_candidate writer を選んだときだけ、着手前後の自駒・利きを取る。
+    // king_candidate・kept_king_candidate_* の writer のどれかを選んだときだけ、着手前後の自駒・利きを取る。
     king_candidate: bool,
     assemble_inputs: bool,
     history_frames: usize,
@@ -250,6 +269,8 @@ struct SideState {
     // このプレイヤーの王手の本手で作った相手玉の推定位置 (出力 square 順)。次の
     // このプレイヤーの着手 (反則を含む) で作り直すか消す。
     king_candidate: Option<Vec<f32>>,
+    // king_candidate と同じ値。反則の指し直しでは消さず、次のこのプレイヤーの本手で作り直すか消す。
+    kept_king_candidate: Option<Vec<f32>>,
 }
 
 // 途中局面から始める局の、Python から受け取る状態 (initial_states の 1 要素)。マスは絶対座標の
@@ -267,6 +288,9 @@ struct PySideToMoveStart {
     my_capture_kind: Option<String>,
     my_capture_to: Option<(u8, u8)>,
     king_candidate: Option<Vec<f32>>,
+    // キーが無ければ None (この状態を渡さない呼び出し側のため)。
+    #[pyo3(default)]
+    kept_king_candidate: Option<Vec<f32>>,
 }
 
 #[derive(FromPyObject)]
@@ -354,6 +378,11 @@ impl InitialState {
         {
             return Err("king_candidate must have one value per square".to_string());
         }
+        if let Some(king) = &mover.kept_king_candidate
+            && king.len() != config.square_count
+        {
+            return Err("kept_king_candidate must have one value per square".to_string());
+        }
         let side_to_move = SideState {
             self_last_check: mover.self_last_check,
             turn_fouled: mover.turn_fouled,
@@ -364,6 +393,7 @@ impl InitialState {
             my_capture_kind: start_optional_kind(mover.my_capture_kind.as_ref())?,
             my_capture_to: mover.my_capture_to.map(start_square).transpose()?,
             king_candidate: mover.king_candidate.clone(),
+            kept_king_candidate: mover.kept_king_candidate.clone(),
         };
         let opponent = SideState {
             self_last_check: state.opponent.self_last_check,
@@ -985,6 +1015,46 @@ impl GameSlot {
                         frame[start..start + config.square_count].copy_from_slice(&king);
                     }
                 }
+                PlaneWriter::LastFoulMoveNoDrop => {
+                    if let Some(Move::Normal { from, to, .. }) = my_last_move {
+                        Self::write_square(&mut frame, channel, from, color, config, -1.0);
+                        Self::write_square(&mut frame, channel, to, color, config, 1.0);
+                    }
+                }
+                PlaneWriter::KeptKingCandidateCertain | PlaneWriter::KeptKingCandidateWithFar => {
+                    if let Some(king) = &side.kept_king_candidate {
+                        // KingCandidate と同じ値 (取られたマスの補正を含む) を、確定 (1.0) だけか、
+                        // 0 より大きいマス全部 (1.0 と 0.5) かで 1.0 にする。
+                        let king = self.king_candidate_with_capture(king, color, config);
+                        let certain_only = matches!(writer, PlaneWriter::KeptKingCandidateCertain);
+                        let start = channel * config.square_count;
+                        for (index, value) in king.iter().enumerate() {
+                            if (certain_only && *value == 1.0) || (!certain_only && *value > 0.0) {
+                                frame[start + index] = 1.0;
+                            }
+                        }
+                    }
+                }
+                PlaneWriter::LastRealMoveNoDrop => {
+                    if let Some(Move::Normal { from, to, .. }) = side.last_real_move {
+                        Self::write_square(&mut frame, channel, from, color, config, -1.0);
+                        Self::write_square(&mut frame, channel, to, color, config, 1.0);
+                    }
+                }
+                PlaneWriter::OpponentPieceAtLeast(kind, threshold, total) => {
+                    // 相手の盤上 + 持駒の数 = 両者の合計 - 自分の盤上の駒 (成駒を含む) - 自分の持駒。
+                    // 相手の駒は読まない。
+                    let position = self.game.position();
+                    let on_board = position.piece_bitboard(Piece::new(kind, color)).count()
+                        + kind.promote().map_or(0, |promoted| {
+                            position.piece_bitboard(Piece::new(promoted, color)).count()
+                        });
+                    let in_hand = position.hand(Piece::new(kind, color)).unwrap_or(0);
+                    let remaining = i16::from(total) - i16::from(on_board) - i16::from(in_hand);
+                    if remaining >= i16::from(threshold) {
+                        Self::fill_channel(&mut frame, channel, config, 1.0);
+                    }
+                }
             }
         }
         frame
@@ -1269,6 +1339,10 @@ impl GameSlot {
                 }
                 _ => None,
             };
+            if !matches!(info, Info::Foul | Info::FoulUnderCheck) {
+                self.side[side_index].kept_king_candidate =
+                    self.side[side_index].king_candidate.clone();
+            }
             let result = match info {
                 Info::Checkmate => Some(if pending.color == Color::Black { 1 } else { -1 }),
                 Info::LossByFoul => Some(if pending.color == Color::Black { -1 } else { 1 }),
@@ -1472,9 +1546,14 @@ impl PySelfPlayBatch {
             .map(|(name, _)| PlaneWriter::parse(name))
             .collect::<Result<Vec<_>, _>>()
             .map_err(PyValueError::new_err)?;
-        let king_candidate = writers
-            .iter()
-            .any(|writer| matches!(writer, PlaneWriter::KingCandidate));
+        let king_candidate = writers.iter().any(|writer| {
+            matches!(
+                writer,
+                PlaneWriter::KingCandidate
+                    | PlaneWriter::KeptKingCandidateCertain
+                    | PlaneWriter::KeptKingCandidateWithFar
+            )
+        });
         if history_channels
             .iter()
             .chain(real_history_channels.iter())
