@@ -89,6 +89,7 @@ enum PlaneWriter {
     KeptKingCandidateCertain,
     KeptKingCandidateWithFar,
     LastRealMoveNoDrop,
+    KeptKingCandidateFarOnly,
     // (駒種, しきい値, 両者の合計)。合計は Python が名前に載せる (Rust は盤面の駒数の表を持たない)。
     OpponentPieceAtLeast(PieceKind, u8, u8),
 }
@@ -141,6 +142,7 @@ impl PlaneWriter {
             ["last_foul_move_no_drop"] => Ok(Self::LastFoulMoveNoDrop),
             ["kept_king_candidate_certain"] => Ok(Self::KeptKingCandidateCertain),
             ["kept_king_candidate_with_far"] => Ok(Self::KeptKingCandidateWithFar),
+            ["kept_king_candidate_far_only"] => Ok(Self::KeptKingCandidateFarOnly),
             ["last_real_move_no_drop"] => Ok(Self::LastRealMoveNoDrop),
             ["opponent_piece_ge", piece, threshold, total] => Ok(Self::OpponentPieceAtLeast(
                 kind(piece)?,
@@ -1035,6 +1037,19 @@ impl GameSlot {
                         }
                     }
                 }
+                PlaneWriter::KeptKingCandidateFarOnly => {
+                    if let Some(king) = &side.kept_king_candidate {
+                        // KeptKingCandidateCertain・KeptKingCandidateWithFar と同じ値のうち、0.5 のマス
+                        // (遠い利きだけが増えたマス) を 1.0 にする。
+                        let king = self.king_candidate_with_capture(king, color, config);
+                        let start = channel * config.square_count;
+                        for (index, value) in king.iter().enumerate() {
+                            if *value == 0.5 {
+                                frame[start + index] = 1.0;
+                            }
+                        }
+                    }
+                }
                 PlaneWriter::LastRealMoveNoDrop => {
                     if let Some(Move::Normal { from, to, .. }) = side.last_real_move {
                         Self::write_square(&mut frame, channel, from, color, config, -1.0);
@@ -1552,6 +1567,7 @@ impl PySelfPlayBatch {
                 PlaneWriter::KingCandidate
                     | PlaneWriter::KeptKingCandidateCertain
                     | PlaneWriter::KeptKingCandidateWithFar
+                    | PlaneWriter::KeptKingCandidateFarOnly
             )
         });
         if history_channels
