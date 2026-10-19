@@ -90,6 +90,7 @@ enum PlaneWriter {
     KeptKingCandidateWithFar,
     LastRealMoveNoDrop,
     KeptKingCandidateFarOnly,
+    LastRealPromoted,
     // (駒種, しきい値, 両者の合計)。合計は Python が名前に載せる (Rust は盤面の駒数の表を持たない)。
     OpponentPieceAtLeast(PieceKind, u8, u8),
 }
@@ -144,6 +145,7 @@ impl PlaneWriter {
             ["kept_king_candidate_with_far"] => Ok(Self::KeptKingCandidateWithFar),
             ["kept_king_candidate_far_only"] => Ok(Self::KeptKingCandidateFarOnly),
             ["last_real_move_no_drop"] => Ok(Self::LastRealMoveNoDrop),
+            ["last_real_promoted"] => Ok(Self::LastRealPromoted),
             ["opponent_piece_ge", piece, threshold, total] => Ok(Self::OpponentPieceAtLeast(
                 kind(piece)?,
                 level(threshold)?,
@@ -1054,6 +1056,12 @@ impl GameSlot {
                     if let Some(Move::Normal { from, to, .. }) = side.last_real_move {
                         Self::write_square(&mut frame, channel, from, color, config, -1.0);
                         Self::write_square(&mut frame, channel, to, color, config, 1.0);
+                    }
+                }
+                PlaneWriter::LastRealPromoted => {
+                    // 自分の直前の本手が成る操作なら全面 1.0 (LastRealToPromoted の 2.0 と同じ判定)。
+                    if side.last_real_promoted {
+                        Self::fill_channel(&mut frame, channel, config, 1.0);
                     }
                 }
                 PlaneWriter::OpponentPieceAtLeast(kind, threshold, total) => {
