@@ -93,6 +93,9 @@ enum PlaneWriter {
     LastRealPromoted,
     // (駒種, しきい値, 両者の合計)。合計は Python が名前に載せる (Rust は盤面の駒数の表を持たない)。
     OpponentPieceAtLeast(PieceKind, u8, u8),
+    LastRealDrop,
+    CapturePosition,
+    MyCaptureKind(PieceKind),
 }
 
 impl PlaneWriter {
@@ -151,6 +154,9 @@ impl PlaneWriter {
                 level(threshold)?,
                 count(total)?,
             )),
+            ["last_real_drop"] => Ok(Self::LastRealDrop),
+            ["capture_pos"] => Ok(Self::CapturePosition),
+            ["my_capture_kind", piece] => Ok(Self::MyCaptureKind(kind(piece)?)),
             _ => Err(format!("unknown observation plane writer {value:?}")),
         }
     }
@@ -1075,6 +1081,23 @@ impl GameSlot {
                     let in_hand = position.hand(Piece::new(kind, color)).unwrap_or(0);
                     let remaining = i16::from(total) - i16::from(on_board) - i16::from(in_hand);
                     if remaining >= i16::from(threshold) {
+                        Self::fill_channel(&mut frame, channel, config, 1.0);
+                    }
+                }
+                PlaneWriter::LastRealDrop => {
+                    if let Some(Move::Drop { to, .. }) = side.last_real_move {
+                        Self::write_square(&mut frame, channel, to, color, config, 1.0);
+                    }
+                }
+                PlaneWriter::CapturePosition => {
+                    // 駒種を問わず、取られたマスに 1.0。
+                    if let Some(square) = self.last_capture_to {
+                        Self::write_square(&mut frame, channel, square, color, config, 1.0);
+                    }
+                }
+                PlaneWriter::MyCaptureKind(kind) => {
+                    // 自分の直前の本手で取った駒の駒種なら全面 1.0 (位置は書かない)。
+                    if side.my_capture_kind == Some(kind) {
                         Self::fill_channel(&mut frame, channel, config, 1.0);
                     }
                 }
